@@ -24,7 +24,10 @@ use std::{
 };
 
 use datafusion::{
-    arrow::datatypes::{DataType, Field, Schema, SchemaRef},
+    arrow::{
+        datatypes::{DataType, Field, Schema, SchemaRef},
+        record_batch::RecordBatch,
+    },
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
@@ -241,8 +244,7 @@ impl<T, P> Display for SqlTable<T, P> {
     }
 }
 
-static ONE_COLUMN_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(Schema::new(vec![Field::new("1", DataType::Int64, true)])));
+static EMPTY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| Arc::new(Schema::empty()));
 
 pub fn project_schema_safe(
     schema: &SchemaRef,
@@ -251,10 +253,11 @@ pub fn project_schema_safe(
     let schema = match projection {
         Some(columns) => {
             if columns.is_empty() {
-                // If the projection is Some([]) then it gets unparsed as `SELECT 1`, so return a schema with a single Int64 column.
-                //
-                // See: <https://github.com/apache/datafusion/blob/83ce79c39412a4f150167d00e40ea05948c4870f/datafusion/sql/src/unparser/plan.rs#L998>
-                Arc::clone(&ONE_COLUMN_SCHEMA)
+                // Empty projection: DataFusion expects 0 columns from the scan.
+                // The SQL unparser converts this to "SELECT 1", but we return an empty schema
+                // to match DataFusion's expectations. The execute() method will handle
+                // dropping the dummy column from the query results.
+                Arc::clone(&EMPTY_SCHEMA)
             } else {
                 Arc::new(schema.project(columns)?)
             }
@@ -355,6 +358,26 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
         tracing::debug!("SqlExec sql: {sql}");
 
         let schema = self.schema();
+
+        // For empty projections, the SQL becomes "SELECT 1" but we need to return
+        // empty batches (0 columns) to match the schema. We query with a dummy
+        // 1-column schema then drop the column, preserving the row count.
+        if schema.fields().is_empty() {
+            let dummy_schema =
+                Arc::new(Schema::new(vec![Field::new("1", DataType::Int64, true)]));
+            let empty_schema = Arc::clone(&schema);
+            let fut = get_stream(Arc::clone(&self.pool), sql, dummy_schema);
+            let stream = futures::stream::once(fut)
+                .try_flatten()
+                .map_ok(move |batch| {
+                    // Return a batch with 0 columns but the same row count as the source
+                    let options = datafusion::arrow::record_batch::RecordBatchOptions::new()
+                        .with_row_count(Some(batch.num_rows()));
+                    RecordBatch::try_new_with_options(Arc::clone(&empty_schema), vec![], &options)
+                        .unwrap_or_else(|_| RecordBatch::new_empty(Arc::clone(&empty_schema)))
+                });
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)));
+        }
 
         let fut = get_stream(Arc::clone(&self.pool), sql, Arc::clone(&schema));
 
